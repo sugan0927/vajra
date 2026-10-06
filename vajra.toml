@@ -1,0 +1,79 @@
+# Vajra example configuration. Run with:  vajra --config vajra.toml
+
+[server]
+listen  = "0.0.0.0:8080"
+grace_secs = 10      # graceful-shutdown drain deadline
+workers = 0          # 0 = one worker per CPU
+pin     = true       # pin each worker to its CPU
+
+[limits]
+max_conns                = 65536     # per worker
+read_buf_size            = 8192      # per-connection receive staging buffer
+ring_entries             = 1024
+max_body_bytes           = 1048576   # buffered request bodies (proxy routes, h2 uploads)
+max_proxy_response_bytes = 16777216  # buffered upstream responses
+
+[static]
+root             = "./public"   # relative to this file
+index            = "index.html"
+cache_ttl_secs   = 2
+max_cached_files = 4096
+
+# --- HTTPS + HTTP/2 -------------------------------------------------------
+# Generate a development certificate with:  ./scripts/gen-dev-cert.sh
+# Then uncomment. HTTP/2 is negotiated via ALPN on this listener.
+#
+# [tls]
+# listen = "0.0.0.0:8443"
+# cert   = "certs/cert.pem"
+# key    = "certs/key.pem"
+
+# --- HTTP/3 (QUIC) -----------------------------------------------------------
+# Requires [tls]. Binds UDP on every core; Alt-Svc is advertised on h1/h2.
+#
+# [quic]
+# listen            = "0.0.0.0:8443"
+# retry             = true     # address validation (recommended)
+# idle_timeout_secs = 30
+# max_streams       = 100
+# advertise         = ""       # optional Alt-Svc override
+
+# --- PHP / WordPress (FastCGI to PHP-FPM) -----------------------------------
+# Needs [static]; its root is the document root. See docs/WORDPRESS.md.
+# Raise [limits] max_body_bytes to your largest upload (buffered in memory).
+#
+# [php]
+# upstream         = "unix:/run/php/php8.3-fpm.sock"   # or "127.0.0.1:9000" / upstreams = [...]
+# index            = ["index.php"]
+# front_controller = "/index.php"                      # "" disables; WordPress permalinks need it
+# deny_exec        = ["/wp-content/uploads/"]          # scripts here never run
+# timeout_secs     = 60
+
+# --- Reverse proxy ----------------------------------------------------------
+# Longest matching prefix wins; /health is always served locally.
+# WebSocket upgrades are tunnelled through any route automatically.
+# Use `upstream = "host:port"` OR `upstreams = [...]` (not both).
+#
+# [[proxy]]
+# prefix             = "/api/"
+# upstreams          = ["127.0.0.1:9000", "127.0.0.1:9001"]
+# balance            = "round_robin"   # round_robin | least_conn | ip_hash
+# max_fails          = 3               # consecutive failures before an upstream is skipped
+# fail_timeout_secs  = 10              # how long it stays skipped before a probe
+# strip_prefix       = false
+# timeout_secs       = 30
+# cache              = true            # per-core response cache for GET/HEAD
+# cache_default_ttl_secs = 30
+
+# --- Response cache (per worker; each core holds its own copy) ---------------
+[cache]
+max_entries      = 4096
+max_bytes        = 67108864
+max_object_bytes = 1048576
+
+# --- Logging and metrics ----------------------------------------------------
+# [logging]
+# access_log = "/var/log/vajra/access.log"   # Common Log Format; reopened on reload
+#
+# [admin]                                    # NO authentication: bind to loopback only
+# listen = "127.0.0.1:9100"                  # /metrics  /healthz  POST /reload

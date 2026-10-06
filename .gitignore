@@ -1,0 +1,6 @@
+/target
+/fuzz/target
+/certs
+*.log
+access.log
+.venv/

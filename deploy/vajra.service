@@ -1,0 +1,27 @@
+[Unit]
+Description=Vajra web server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vajra
+Group=vajra
+ExecStart=/usr/local/bin/vajra --config /etc/vajra/vajra.toml
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/log/vajra
+ReadOnlyPaths=/etc/vajra /var/www
+# io_uring is allowed by default; remove it from any restrictive SystemCallFilter you add.
+
+[Install]
+WantedBy=multi-user.target

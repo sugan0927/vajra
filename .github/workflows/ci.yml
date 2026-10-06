@@ -1,0 +1,25 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "clippy, rustfmt" }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets          # io_uring tests skip themselves if the runner forbids it
+      - run: cargo doc --no-deps
+  fuzz-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - run: |
+          cd fuzz
+          for t in h1_request h2_frames h3_request h3_uni qpack_block upstream_response config_toml cache_headers static_path; do
+            cargo +nightly fuzz run $t -- -max_total_time=60 -rss_limit_mb=2048
+          done

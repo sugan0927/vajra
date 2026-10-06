@@ -1,0 +1,52 @@
+[package]
+name = "vajra"
+version = "0.7.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Vajra: a thread-per-core, io_uring based web server"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "vajra"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vajra"
+path = "src/main.rs"
+
+[dependencies]
+# io_uring bindings (tokio-rs). We drive the ring ourselves: no async runtime.
+io-uring = "0.7"
+# Raw syscalls / constants.
+libc = "0.2"
+# Zero-allocation HTTP/1.x parser (requests from clients, responses from upstreams).
+httparse = "1.9"
+# Socket construction (SO_REUSEPORT, TCP_NODELAY, SockAddr for connect).
+socket2 = { version = "0.5", features = ["all"] }
+# Config file.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# TLS: rustls is sans-I/O, which is exactly what an io_uring loop wants.
+# The `ring` provider avoids needing cmake/NASM to build aws-lc.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+# QUIC: quinn-proto is the sans-I/O QUIC state machine (no sockets, no runtime), so the
+# UDP I/O and timers stay on our io_uring loop. HTTP/3 + QPACK framing is in src/h3.rs.
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
+bytes = "1"
+# HPACK *decoder* (Huffman + dynamic table). The encoder is hand-written in h2.rs.
+hpack = "0.3"
+
+[dev-dependencies]
+# Self-signed certificates for the TLS / HTTP/2 end-to-end tests.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 1
+
+[profile.bench]
+inherits = "release"

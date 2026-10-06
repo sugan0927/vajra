@@ -1,0 +1,323 @@
+//! Deterministic mutation tests: the same entry points the cargo-fuzz targets
+//! cover, driven by a seeded PRNG so they run in every `cargo test` with no
+//! extra tooling. They assert "no panic, no runaway consumption", not output.
+
+use vajra::cache::{self, Cache, CachePolicy};
+use vajra::config::{CacheSettings, ProxySettings, Settings};
+use vajra::date::DATE_LEN;
+use vajra::h2::{H2Body, H2Conn, H2Response};
+use vajra::h3::{self, qpack, RequestStream, UniStream};
+use vajra::http::{self, Ctx};
+use vajra::observe::Observer;
+use vajra::proxy::{parse_response_head, Chunked, Framing, HeadParse, ProxyTable};
+
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n.max(1) as u64) as usize
+    }
+}
+
+/// Flip, overwrite, insert, delete, duplicate and truncate bytes.
+fn mutate(rng: &mut Rng, seed: &[u8]) -> Vec<u8> {
+    let mut m = seed.to_vec();
+    for _ in 0..1 + rng.below(6) {
+        if m.is_empty() {
+            m.push(rng.next() as u8);
+            continue;
+        }
+        let i = rng.below(m.len());
+        match rng.below(7) {
+            0 => m[i] ^= 1 << rng.below(8),
+            1 => m[i] = rng.next() as u8,
+            2 => m.insert(i, rng.next() as u8),
+            3 => {
+                m.remove(i);
+            }
+            4 => {
+                let j = i + rng.below(m.len() - i);
+                let dup = m[i..=j].to_vec();
+                m.splice(i..i, dup);
+            }
+            5 => m.truncate(i),
+            _ => m[i] = [0x00, 0xff, b'\r', b'\n', b':', b' '][rng.below(6)],
+        }
+        if m.len() > 64 * 1024 {
+            m.truncate(64 * 1024);
+        }
+    }
+    m
+}
+
+const ITER: usize = 6_000;
+
+#[test]
+fn http1_requests_never_panic_and_consumption_is_bounded() {
+    let seeds: &[&[u8]] = &[
+        b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+        b"GET /index.html?a=b HTTP/1.1\r\nHost: x\r\nIf-None-Match: \"1\"\r\n\r\n",
+        b"POST /api/x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello",
+        b"GET /api/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+        b"GET /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nGET /b HTTP/1.0\r\n\r\n",
+        b"GET /%2e%2e/%2e%2e/etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n",
+        b"HEAD /health HTTP/1.1\r\nConnection: close\r\n\r\n",
+    ];
+    let mut p = ProxySettings::simple("/api/", "127.0.0.1:9".parse().unwrap(), false, 5);
+    p.cache = true;
+    let table = ProxyTable::new(&[p], 1 << 20);
+    let mut cache = Cache::new(&CacheSettings::default());
+    let mut obs = Observer::new();
+    let date = [b'D'; DATE_LEN];
+    let mut rng = Rng(0x0123_4567_89ab_cdef);
+
+    for _ in 0..ITER {
+        let seed = seeds[rng.below(seeds.len())];
+        let input = mutate(&mut rng, seed);
+        let mut buf = input.clone();
+        let mut out = Vec::new();
+        for _ in 0..32 {
+            let mut ctx = Ctx {
+                files: None,
+                proxies: &table,
+                cache: &mut cache,
+                obs: &mut obs,
+                now: 10,
+                max_body: 1024,
+                secure: false,
+                client_ip: Some("192.0.2.1".parse().unwrap()),
+            };
+            let o = http::process(&buf, &mut out, &date, &mut ctx);
+            assert!(o.consumed <= buf.len());
+            buf.drain(..o.consumed);
+            out.clear();
+            if o.close || o.consumed == 0 || buf.is_empty() {
+                break;
+            }
+        }
+    }
+}
+
+#[test]
+fn http2_connection_survives_mutated_frame_streams() {
+    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    let seeds: Vec<Vec<u8>> = vec![
+        // empty SETTINGS, then HEADERS (:method GET, :scheme https, :path /) on stream 1
+        [&[0, 0, 0, 4, 0, 0, 0, 0, 0][..], &[0, 0, 5, 1, 5, 0, 0, 0, 1, 0x82, 0x87, 0x84, 0x41, 0x01]].concat(),
+        // WINDOW_UPDATE, PING, PRIORITY, RST_STREAM, GOAWAY
+        [&[0, 0, 4, 8, 0, 0, 0, 0, 0, 0, 0, 1, 0][..], &[0, 0, 8, 6, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]].concat(),
+        vec![0, 0, 5, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 16],
+        vec![0, 0, 4, 3, 0, 0, 0, 0, 1, 0, 0, 0, 8],
+        vec![0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    ];
+    let mut rng = Rng(0xdead_beef_cafe_f00d);
+    for _ in 0..ITER {
+        let mut out = Vec::new();
+        let mut h = H2Conn::new(1 << 16, &mut out);
+        let mut input = PREFACE.to_vec();
+        let _idx = rng.below(seeds.len());
+        input.extend(mutate(&mut rng, &seeds[_idx]));
+        for _ in 0..16 {
+            let fed = h.feed(&input, &mut out);
+            assert!(fed.consumed <= input.len());
+            input.drain(..fed.consumed);
+            while let Some(r) = h.take_ready() {
+                h.respond(
+                    r.stream,
+                    H2Response { status: 200, headers: vec![], body: H2Body::Mem(vec![1; 20_000]) },
+                    &mut out,
+                );
+            }
+            while h.poll_output(&mut out).is_some() {}
+            out.clear();
+            if fed.fatal || fed.consumed == 0 || input.is_empty() {
+                break;
+            }
+        }
+    }
+}
+
+#[test]
+fn http3_streams_and_qpack_never_panic() {
+    let mut get = Vec::new();
+    h3::request_headers_frame("GET", "h", "/a?b", &[("accept", "*/*"), ("cookie", "a=1")], &mut get);
+    let mut post = Vec::new();
+    h3::request_headers_frame("POST", "h", "/p", &[("content-length", "4")], &mut post);
+    h3::data_frame(b"abcd", &mut post);
+    let ctl = {
+        let mut c = h3::control_stream_preface();
+        c.extend_from_slice(&[0x07, 0x01, 0x04]);
+        c
+    };
+    let mut block = vec![0, 0];
+    qpack::encode_field(b"x-custom", b"value", &mut block);
+    qpack::encode_field(b":status", b"200", &mut block);
+
+    let mut rng = Rng(0x5eed_5eed_5eed_5eed);
+    let mut dec = qpack::Decoder::new(16 * 1024);
+    for _ in 0..ITER * 3 {
+        let m = mutate(&mut rng, &get);
+        let cut = rng.below(m.len() + 1);
+        let mut rs = RequestStream::new(4096);
+        let _ = rs.feed(&m[..cut], false, &mut dec);
+        let _ = rs.feed(&m[cut..], true, &mut dec);
+        let _ = RequestStream::new(4096).feed(&mutate(&mut rng, &post), true, &mut dec);
+
+        let mut u = UniStream::new();
+        for chunk in mutate(&mut rng, &ctl).chunks(1 + rng.below(9)) {
+            if u.feed(chunk).is_err() {
+                break;
+            }
+        }
+        let _ = dec.decode(&mutate(&mut rng, &block));
+    }
+}
+
+#[test]
+fn upstream_responses_and_chunked_bodies_never_panic() {
+    let seeds: &[&[u8]] = &[
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        b"HTTP/1.0 200 OK\r\nConnection: close\r\n\r\nbody until close",
+        b"HTTP/1.1 204 No Content\r\n\r\n",
+        b"HTTP/1.1 301 Moved\r\nLocation: /x\r\nSet-Cookie: a=b\r\nContent-Length: 0\r\n\r\n",
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n",
+    ];
+    let mut rng = Rng(0xabad_1dea_abad_1dea);
+    for _ in 0..ITER * 3 {
+        let m = { let _idx = rng.below(seeds.len()); mutate(&mut rng, seeds[_idx]) };
+        if let HeadParse::Done(h) = parse_response_head(&m, rng.below(2) == 0) {
+            assert!(h.head_len <= m.len());
+            if h.framing == Framing::Chunked {
+                let mut c = Chunked::default();
+                let raw = &m[h.head_len..];
+                for end in (0..=raw.len()).step_by(3).chain([raw.len()]) {
+                    if c.advance(&raw[..end], 4096).is_err() || c.done {
+                        break;
+                    }
+                }
+                assert!(c.consumed <= raw.len());
+            }
+        }
+        let mut c = Chunked::default();
+        let _ = c.advance(&m, 4096);
+    }
+}
+
+#[test]
+fn config_parser_rejects_garbage_without_panicking() {
+    let seeds = [
+        "[server]\nlisten = \"127.0.0.1:8080\"\nworkers = 2\n",
+        "[[proxy]]\nprefix = \"/api/\"\nupstreams = [\"127.0.0.1:1\", \"127.0.0.1:2\"]\nbalance = \"ip_hash\"\n",
+        "[limits]\nmax_conns = 10\nring_entries = 64\n[cache]\nmax_entries = 5\n",
+        "[logging]\naccess_log = \"a.log\"\n[admin]\nlisten = \"127.0.0.1:9\"\n",
+    ];
+    let mut rng = Rng(0x7777_1234_5678_9999);
+    for _ in 0..ITER {
+        let _idx = rng.below(seeds.len());
+        let m = mutate(&mut rng, seeds[_idx].as_bytes());
+        if let Ok(text) = std::str::from_utf8(&m) {
+            let _ = Settings::from_toml_str(text, std::path::Path::new("/nonexistent-vajra-robustness"));
+        }
+    }
+}
+
+#[test]
+fn cache_policy_handles_hostile_headers() {
+    let policy = CachePolicy { default_ttl: 30, max_object_bytes: 1 << 20 };
+    let seeds: &[&[u8]] = &[
+        b"cache-control: max-age=60\nset-cookie: a=b\nvary: accept",
+        b"cache-control: s-maxage=99999999999999999999, no-store\nexpires: x",
+        b"cache-control: ,,,max-age=,\n\n::\n",
+    ];
+    let mut rng = Rng(0x1111_2222_3333_4444);
+    for _ in 0..ITER {
+        let m = { let _idx = rng.below(seeds.len()); mutate(&mut rng, seeds[_idx]) };
+        let headers: Vec<(Vec<u8>, Vec<u8>)> = m
+            .split(|&b| b == b'\n')
+            .map(|l| match l.iter().position(|&b| b == b':') {
+                Some(i) => (l[..i].to_vec(), l[i + 1..].trim_ascii().to_vec()),
+                None => (l.to_vec(), Vec::new()),
+            })
+            .collect();
+        let _ = cache::ttl_for(200, &headers, m.len(), &policy);
+        let _ = cache::storable_headers(&headers);
+        let b: Vec<(&[u8], &[u8])> = headers.iter().map(|(n, v)| (n.as_slice(), v.as_slice())).collect();
+        let _ = cache::request_bypasses(&b);
+        let _ = cache::cache_key(&m, &String::from_utf8_lossy(&m));
+    }
+}
+
+#[test]
+fn static_path_mapping_never_escapes_the_root() {
+    use vajra::config::StaticSettings;
+    use vajra::static_files::{FileCache, Lookup};
+
+    let base = std::env::temp_dir().join(format!("vajra-robust-{}", std::process::id()));
+    let root = base.join("root");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("index.html"), "x").unwrap();
+    std::fs::write(root.join("sub/a.txt"), "yy").unwrap();
+    std::fs::write(base.join("secret.txt"), "this is outside the root").unwrap();
+    // A symlink pointing out of the root must not be followed.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(base.join("secret.txt"), root.join("link.txt")).unwrap();
+
+    let mut fc = FileCache::new(&StaticSettings::new(&root).unwrap());
+    let seeds = ["/", "/sub/a.txt", "/../secret.txt", "/sub/../../secret.txt", "/%2e%2e/secret.txt", "/link.txt", "/sub/%2e%2e/index.html"];
+    let mut rng = Rng(0x4242_4242_4242_4242);
+    for _ in 0..ITER * 2 {
+        let _idx = rng.below(seeds.len());
+        let m = mutate(&mut rng, seeds[_idx].as_bytes());
+        let Ok(path) = std::str::from_utf8(&m) else { continue };
+        if let Lookup::Found(f) = fc.lookup(path) {
+            assert!(f.size <= 2, "found a file outside the root via {path:?} (size {})", f.size);
+        }
+    }
+    for p in ["/../secret.txt", "/%2e%2e/secret.txt", "/link.txt", "/sub/../../secret.txt"] {
+        assert!(!matches!(fc.lookup(p), Lookup::Found(_)), "{p} must not be served");
+    }
+}
+
+#[test]
+fn fastcgi_streams_and_cgi_output_never_panic() {
+    use vajra::fastcgi::{cgi_to_http, Decoder};
+    fn rec(ty: u8, c: &[u8]) -> Vec<u8> {
+        let mut v = vec![1, ty, 0, 1];
+        v.extend_from_slice(&(c.len() as u16).to_be_bytes());
+        v.extend_from_slice(&[2, 0]);
+        v.extend_from_slice(c);
+        v.extend_from_slice(&[0, 0]);
+        v
+    }
+    let mut seed = rec(6, b"Status: 302 Found\r\nLocation: /x\r\nSet-Cookie: a=b\r\n\r\nbody");
+    seed.extend(rec(7, b"PHP Notice: x"));
+    seed.extend(rec(3, &[0; 8]));
+    let cgi: &[&[u8]] = &[
+        b"Status: 200 OK\r\nContent-Type: text/html\r\n\r\nhello",
+        b"Location: /a\n\n",
+        b"Status: 404\r\n\r\n",
+    ];
+    let mut rng = Rng(0x1234_5678_9abc_def1);
+    for _ in 0..ITER * 3 {
+        let m = mutate(&mut rng, &seed);
+        let mut d = Decoder::new();
+        let cut = rng.below(m.len() + 1);
+        let _ = d.feed(&m[..cut], 4096);
+        let _ = d.feed(&m[cut..], 4096);
+        if let Ok(http) = d.take_http(rng.below(2) == 0) {
+            // Whatever we synthesise must be acceptable to the proxy's own parser.
+            assert!(matches!(parse_response_head(&http, false), HeadParse::Done(_) | HeadParse::Partial | HeadParse::Bad));
+        }
+        let c = { let _idx = rng.below(cgi.len()); mutate(&mut rng, cgi[_idx]) };
+        if let Ok(http) = cgi_to_http(&c, false) {
+            assert!(matches!(parse_response_head(&http, false), HeadParse::Done(_)), "synthesised head must parse: {:?}", String::from_utf8_lossy(&http));
+        }
+    }
+}

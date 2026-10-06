@@ -1,0 +1,19 @@
+# Vajra settings used by bench/run.sh (workers/paths are passed on the command line).
+[server]
+listen = "127.0.0.1:8080"
+pin    = true
+
+[limits]
+max_conns = 65536
+
+[static]
+root = "@ROOT@"
+cache_ttl_secs = 2
+
+[cache]
+max_entries = 4096
+
+[[proxy]]
+prefix       = "/api/"
+upstream     = "127.0.0.1:9000"
+timeout_secs = 30

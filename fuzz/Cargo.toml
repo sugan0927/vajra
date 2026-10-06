@@ -1,0 +1,92 @@
+[package]
+name = "vajra-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+vajra = { path = ".." }
+
+# Keep the fuzz workspace separate from the main crate.
+[workspace]
+
+[[bin]]
+name = "h1_request"
+path = "fuzz_targets/h1_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h2_frames"
+path = "fuzz_targets/h2_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h3_request"
+path = "fuzz_targets/h3_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h3_uni"
+path = "fuzz_targets/h3_uni.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "qpack_block"
+path = "fuzz_targets/qpack_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "upstream_response"
+path = "fuzz_targets/upstream_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cache_headers"
+path = "fuzz_targets/cache_headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "static_path"
+path = "fuzz_targets/static_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fcgi_response"
+path = "fuzz_targets/fcgi_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "php_resolve"
+path = "fuzz_targets/php_resolve.rs"
+test = false
+doc = false
+bench = false
